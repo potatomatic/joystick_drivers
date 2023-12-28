@@ -30,6 +30,9 @@
 
 // \author: Blaise Gassend
 
+#include "file.hpp"
+#include "fd_set.hpp"
+
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/input.h>
@@ -43,6 +46,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <optional>
 
 #include <diagnostic_updater/diagnostic_updater.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -50,10 +54,10 @@
 #include <sensor_msgs/msg/joy_feedback_array.hpp>
 
 /// \brief Opens, reads from and publishes joystick events
-class Joystick
+class JoystickNode
 {
 private:
-  bool open_;
+  std::optional<joy_linux::File> joy_fd_;
   bool sticky_buttons_;
   bool default_trig_val_;
   std::string joy_dev_;
@@ -68,7 +72,7 @@ private:
   rclcpp::Node::SharedPtr node_;
   double lastDiagTime_;
 
-  int ff_fd_;
+  std::optional<joy_linux::File> ff_fd_;
   struct ff_effect joy_effect_;
   bool update_feedback_;
 
@@ -79,7 +83,7 @@ private:
   {
     double now = node_->now().seconds();
     double interval = now - lastDiagTime_;
-    if (open_) {
+    if (joy_fd_) {
       stat.summary(0, "OK");
     } else {
       stat.summary(2, "Joystick not open.");
@@ -155,49 +159,11 @@ private:
   }
 
 public:
-  Joystick()
-  : ff_fd_(-1)
-  {}
-
-  void set_feedback(const std::shared_ptr<sensor_msgs::msg::JoyFeedbackArray> msg)
+  JoystickNode()
   {
-    if (ff_fd_ == -1) {
-      return;  // we arent ready yet
-    }
-
-    size_t size = msg->array.size();
-    for (size_t i = 0; i < size; i++) {
-      // process each feedback
-      if (msg->array[i].type == 1 && ff_fd_ != -1) {  // TYPE_RUMBLE
-        // if id is zero, thats low freq, 1 is high
-        joy_effect_.direction = 0;  // down
-        joy_effect_.type = FF_RUMBLE;
-        if (msg->array[i].id == 0) {
-          joy_effect_.u.rumble.strong_magnitude =
-            (static_cast<float>(1 << 15)) * msg->array[i].intensity;
-        } else {
-          joy_effect_.u.rumble.weak_magnitude =
-            (static_cast<float>(1 << 15)) * msg->array[i].intensity;
-        }
-
-        joy_effect_.replay.length = 1000;
-        joy_effect_.replay.delay = 0;
-
-        update_feedback_ = true;
-      }
-    }
-  }
-
-  /// \brief Opens joystick port, reads from port and publishes while node_ is active
-  int main(int argc, char ** argv)
-  {
-    (void)argc;
-    (void)argv;
-
     node_ = std::make_shared<rclcpp::Node>("joy_node");
-
     diagnostic_ = std::make_shared<diagnostic_updater::Updater>(node_);
-    diagnostic_->add("Joystick Driver Status", this, &Joystick::diagnostics);
+    diagnostic_->add("Joystick Driver Status", this, &JoystickNode::diagnostics);
     diagnostic_->setHardwareID("none");
 
     // Parameters
@@ -206,7 +172,7 @@ public:
       node_->create_subscription<sensor_msgs::msg::JoyFeedbackArray>(
       "joy/set_feedback",
       rclcpp::QoS(10),
-      std::bind(&Joystick::set_feedback, this, std::placeholders::_1));
+      std::bind(&JoystickNode::set_feedback, this, std::placeholders::_1));
 
     joy_dev_ = node_->declare_parameter("dev", std::string("/dev/input/js0"));
     joy_dev_name_ = node_->declare_parameter("dev_name", std::string(""));
@@ -273,6 +239,42 @@ public:
         coalesce_interval_);
       coalesce_interval_ = 0;
     }
+  }
+
+  void set_feedback(const std::shared_ptr<sensor_msgs::msg::JoyFeedbackArray> msg)
+  {
+    if (!ff_fd_) {
+      return;  // we arent ready yet
+    }
+
+    size_t size = msg->array.size();
+    for (size_t i = 0; i < size; i++) {
+      // process each feedback
+      if (msg->array[i].type == 1 && ff_fd_) {  // TYPE_RUMBLE
+        // if id is zero, thats low freq, 1 is high
+        joy_effect_.direction = 0;  // down
+        joy_effect_.type = FF_RUMBLE;
+        if (msg->array[i].id == 0) {
+          joy_effect_.u.rumble.strong_magnitude =
+            (static_cast<float>(1 << 15)) * msg->array[i].intensity;
+        } else {
+          joy_effect_.u.rumble.weak_magnitude =
+            (static_cast<float>(1 << 15)) * msg->array[i].intensity;
+        }
+
+        joy_effect_.replay.length = 1000;
+        joy_effect_.replay.delay = 0;
+
+        update_feedback_ = true;
+      }
+    }
+  }
+
+  /// \brief Opens joystick port, reads from port and publishes while node_ is active
+  int main(int argc, char ** argv)
+  {
+    (void)argc;
+    (void)argv;
 
     // Parameter conversions
     double autorepeat_interval = 1 / autorepeat_rate_;
@@ -281,8 +283,6 @@ public:
 
     js_event event;
     struct timeval tv;
-    fd_set set;
-    int joy_fd;
 
     event_count_ = 0;
     pub_count_ = 0;
@@ -290,256 +290,238 @@ public:
 
     // Big while loop opens, publishes
     while (rclcpp::ok()) {
-      open_ = false;
       diagnostic_->force_update();
-      bool first_fault = true;
-      while (true) {
-        // In the first iteration of this loop, first_fault is true so we just
-        // want to check for rclcpp work and not block.  If it turns out that
-        // we cannot open the joystick device immediately, then in subsequent
-        // iterations we block for up to a second in rclcpp before attempting
-        // to open the joystick device again.  The dummy promise and future
-        // are used to accomplish this 1 second wait.
-        std::promise<void> dummy_promise;
-        std::shared_future<void> dummy_future(dummy_promise.get_future());
-        std::chrono::duration<int64_t, std::milli> timeout;
-        if (first_fault) {
-          timeout = std::chrono::milliseconds(0);
-        } else {
-          timeout = std::chrono::milliseconds(1000);
-        }
-        rclcpp::spin_until_future_complete(node_, dummy_future, timeout);
-        if (!rclcpp::ok()) {
-          goto cleanup;
-        }
-        joy_fd = open(joy_dev_.c_str(), O_RDONLY);
-        if (joy_fd != -1) {
+
+      while (rclcpp::ok() && !joy_fd_) {
+        try {
           // There seems to be a bug in the driver or something where the
           // initial events that are to define the initial state of the
           // joystick are not the values of the joystick when it was opened
           // but rather the values of the joystick when it was last closed.
           // Opening then closing and opening again is a hack to get more
           // accurate initial state data.
-          close(joy_fd);
-          joy_fd = open(joy_dev_.c_str(), O_RDONLY);
-        }
-        if (joy_fd != -1) {
-          break;
-        }
-        if (first_fault) {
-          RCLCPP_ERROR(
-            node_->get_logger(), "Couldn't open joystick %s. Will retry every second.",
-            joy_dev_.c_str());
-          first_fault = false;
+          joy_linux::File {joy_dev_, O_RDONLY};
+          joy_fd_.emplace(joy_dev_, O_RDONLY);
+        } catch (std::system_error const& e) {
+          RCLCPP_ERROR_STREAM_ONCE(
+              node_->get_logger(), "Couldn't open joystick " << joy_dev_ << ": " << e.what() << ". Will retry every second.");
+
+          // Block for up to a second in rclcpp before attempting
+          // to open the joystick device again.  The dummy promise and future
+          // are used to accomplish this 1 second wait.
+          std::promise<void> dummy_promise;
+          std::shared_future<void> dummy_future(dummy_promise.get_future());
+          std::chrono::milliseconds const timeout {1000};
+          rclcpp::spin_until_future_complete(node_, dummy_future, timeout);
         }
       }
 
-      if (!joy_dev_ff_.empty()) {
-        ff_fd_ = open(joy_dev_ff_.c_str(), O_RDWR);
-
-        /* Set the gain of the device*/
-        int gain = 100;           /* between 0 and 100 */
-        struct input_event ie;      /* structure used to communicate with the driver */
-
-        ie.type = EV_FF;
-        ie.code = FF_GAIN;
-        ie.value = 0xFFFFUL * gain / 100;
-
-        if (write(ff_fd_, &ie, sizeof(ie)) == -1) {
-          RCLCPP_WARN(
-            node_->get_logger(), "Couldn't open joystick force feedback: %s", strerror(errno));
-        }
-
-        joy_effect_.id = -1;
-        joy_effect_.direction = 0;  // down
-        joy_effect_.type = FF_RUMBLE;
-        joy_effect_.u.rumble.strong_magnitude = 0;
-        joy_effect_.u.rumble.weak_magnitude = 0;
-        joy_effect_.replay.length = 1000;
-        joy_effect_.replay.delay = 0;
-
-        // upload the effect
-        // FIXME: check the return value here
-        ioctl(ff_fd_, EVIOCSFF, &joy_effect_);
-      }
-
-      RCLCPP_INFO(
-        node_->get_logger(), "Opened joystick: %s. deadzone_: %f.", joy_dev_.c_str(), deadzone_);
-      open_ = true;
-      diagnostic_->force_update();
-
-      bool tv_set = false;
-      bool publication_pending = false;
-      tv.tv_sec = 1;
-      tv.tv_usec = 0;
-
-      // Here because we want to reset it on device close.
-      auto joy_msg = std::make_shared<sensor_msgs::msg::Joy>();
-      double val;  // Temporary variable to hold event values
-      joy_msg->header.frame_id = "joy";
-
-      while (rclcpp::ok()) {
-        rclcpp::spin_some(node_);
-
-        bool publish_now = false;
-        bool publish_soon = false;
-        FD_ZERO(&set);
-        FD_SET(joy_fd, &set);
-
-        int select_out = select(joy_fd + 1, &set, nullptr, nullptr, &tv);
-        if (select_out == -1) {
-          tv.tv_sec = 0;
-          tv.tv_usec = 0;
-          continue;
-        }
-
-        // play the rumble effect (can probably do this at lower rate later)
-        if (ff_fd_ != -1) {
-          struct input_event start;
-          start.type = EV_FF;
-          start.code = joy_effect_.id;
-          start.value = 3;
-          if (write(ff_fd_, (const void *) &start, sizeof(start)) == -1) {
-            break;  // fd closed
-          }
-
-          // upload the effect
-          if (update_feedback_ == true) {
-            // FIXME: check the return value here.
-            ioctl(ff_fd_, EVIOCSFF, &joy_effect_);
-            update_feedback_ = false;
-          }
-        }
-
-        if (FD_ISSET(joy_fd, &set)) {
-          if (read(joy_fd, &event, sizeof(js_event)) == -1 && errno != EAGAIN) {
-            break;  // Joystick is probably closed. Definitely occurs.
-          }
-
-          joy_msg->header.stamp = node_->now();
-          event_count_++;
-          switch (event.type) {
-            case JS_EVENT_BUTTON:
-            case JS_EVENT_BUTTON | JS_EVENT_INIT:
-              if (event.number >= joy_msg->buttons.size()) {
-                size_t old_size = joy_msg->buttons.size();
-                joy_msg->buttons.resize(event.number + 1);
-                for (size_t i = old_size; i < joy_msg->buttons.size(); i++) {
-                  joy_msg->buttons[i] = 0.0;
-                }
-              }
-              if (sticky_buttons_) {
-                if (event.value == 1) {
-                  joy_msg->buttons[event.number] = 1 - joy_msg->buttons[event.number];
-                }
-              } else {
-                joy_msg->buttons[event.number] = (event.value ? 1 : 0);
-              }
-              // For initial events, wait a bit before sending to try to catch
-              // all the initial events.
-              if (!(event.type & JS_EVENT_INIT)) {
-                publish_now = true;
-              } else {
-                publish_soon = true;
-              }
-              break;
-            case JS_EVENT_AXIS:
-            case JS_EVENT_AXIS | JS_EVENT_INIT:
-              val = event.value;
-              if (event.number >= joy_msg->axes.size()) {
-                size_t old_size = joy_msg->axes.size();
-                joy_msg->axes.resize(event.number + 1);
-                for (size_t i = old_size; i < joy_msg->axes.size(); i++) {
-                  joy_msg->axes[i] = 0.0;
-                }
-              }
-              if (default_trig_val_) {
-                // Allows deadzone to be "smooth"
-                if (val > unscaled_deadzone) {
-                  val -= unscaled_deadzone;
-                } else if (val < -unscaled_deadzone) {
-                  val += unscaled_deadzone;
-                } else {
-                  val = 0;
-                }
-                joy_msg->axes[event.number] = val * scale;
-                // Will wait a bit before sending to try to combine events.
-                publish_soon = true;
-                break;
-              } else {
-                if (!(event.type & JS_EVENT_INIT)) {
-                  val = event.value;
-                  if (val > unscaled_deadzone) {
-                    val -= unscaled_deadzone;
-                  } else if (val < -unscaled_deadzone) {
-                    val += unscaled_deadzone;
-                  } else {
-                    val = 0;
-                  }
-                  joy_msg->axes[event.number] = val * scale;
-                }
-
-                publish_soon = true;
-                break;
-              }
-            default:
-              RCLCPP_WARN(
-                node_->get_logger(), "joy_linux_node: Unknown event type. "
-                "Please file a ticket. time=%u, value=%d, type=%Xh, number=%d",
-                event.time, event.value, event.type, event.number);
-              break;
-          }
-        } else if (tv_set) {  // Assume that the timer has expired.
-          joy_msg->header.stamp = node_->now();
-          publish_now = true;
-        }
-
-        if (publish_now) {
-          // Assume that all the JS_EVENT_INIT messages have arrived already.
-          // This should be the case as the kernel sends them along as soon as
-          // the device opens.
-          joy_msg->header.stamp = node_->now();
-          pub_->publish(*joy_msg);
-
-          publish_now = false;
-          tv_set = false;
-          publication_pending = false;
-          publish_soon = false;
-          pub_count_++;
-        }
-
-        // If an axis event occurred, start a timer to combine with other
-        // events.
-        if (!publication_pending && publish_soon) {
-          tv.tv_sec = trunc(coalesce_interval_);
-          tv.tv_usec = (coalesce_interval_ - tv.tv_sec) * 1e6;
-          publication_pending = true;
-          tv_set = true;
-        }
-
-        // If nothing is going on, start a timer to do autorepeat.
-        if (!tv_set && autorepeat_rate_ > 0) {
-          tv.tv_sec = trunc(autorepeat_interval);
-          tv.tv_usec = (autorepeat_interval - tv.tv_sec) * 1e6;
-          tv_set = true;
-        }
-
-        if (!tv_set) {
-          tv.tv_sec = 1;
-          tv.tv_usec = 0;
-        }
-      }  // End of joystick open loop.
-
-      close(ff_fd_);
-      close(joy_fd);
-      rclcpp::spin_some(node_);
       if (rclcpp::ok()) {
-        RCLCPP_ERROR(
-          node_->get_logger(), "Connection to joystick device lost unexpectedly. Will reopen.");
+        if (!joy_dev_ff_.empty()) {
+          try
+          {
+            ff_fd_.emplace(joy_dev_ff_, O_RDWR);
+
+            /* Set the gain of the device*/
+            int gain = 100;           /* between 0 and 100 */
+            struct input_event ie;      /* structure used to communicate with the driver */
+
+            ie.type = EV_FF;
+            ie.code = FF_GAIN;
+            ie.value = 0xFFFFUL * gain / 100;
+
+            ff_fd_->write(&ie, sizeof(ie));
+
+            joy_effect_.id = -1;
+            joy_effect_.direction = 0;  // down
+            joy_effect_.type = FF_RUMBLE;
+            joy_effect_.u.rumble.strong_magnitude = 0;
+            joy_effect_.u.rumble.weak_magnitude = 0;
+            joy_effect_.replay.length = 1000;
+            joy_effect_.replay.delay = 0;
+
+            // upload the effect
+            // FIXME: check the return value here
+            ff_fd_->ioctl(EVIOCSFF, &joy_effect_);
+          }
+          catch (std::system_error const& e)
+          {
+            ff_fd_.reset();
+            RCLCPP_WARN_STREAM(
+              node_->get_logger(), "Couldn't open joystick force feedback: " << e.what());
+          }
+        }
+
+        RCLCPP_INFO_STREAM(
+          node_->get_logger(), "Opened joystick: " << joy_dev_ << ". deadzone_: " << deadzone_);
+        diagnostic_->force_update();
+
+        bool tv_set = false;
+        bool publication_pending = false;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        // Here because we want to reset it on device close.
+        auto joy_msg = std::make_shared<sensor_msgs::msg::Joy>();
+        double val;  // Temporary variable to hold event values
+        joy_msg->header.frame_id = "joy";
+
+        while (rclcpp::ok()) {
+          rclcpp::spin_some(node_);
+
+          bool publish_now = false;
+          bool publish_soon = false;
+          joy_linux::FdSet set {joy_fd_->descriptor()};
+
+          try
+          {
+            joy_linux::select(joy_fd_->descriptor() + 1, &set, nullptr, nullptr, tv);
+
+            // play the rumble effect (can probably do this at lower rate later)
+            if (ff_fd_) {
+              input_event start {};
+              start.type = EV_FF;
+              start.code = joy_effect_.id;
+              start.value = 3;
+              ff_fd_->write(&start, sizeof(start));
+
+              // upload the effect
+              if (update_feedback_) {
+                ff_fd_->ioctl(EVIOCSFF, &joy_effect_);
+                update_feedback_ = false;
+              }
+            }
+
+            if (set.isset(joy_fd_->descriptor())) {
+              joy_fd_->read(&event, sizeof(js_event));
+
+              joy_msg->header.stamp = node_->now();
+              event_count_++;
+
+              RCLCPP_INFO_STREAM(node_->get_logger(), "Event type " << std::hex << static_cast<int>(event.type));
+
+              switch (event.type) {
+                case JS_EVENT_BUTTON:
+                case JS_EVENT_BUTTON | JS_EVENT_INIT:
+                  if (event.number >= joy_msg->buttons.size()) {
+                    joy_msg->buttons.resize(event.number + 1, 0.);
+                  }
+                  if (sticky_buttons_) {
+                    if (event.value == 1) {
+                      joy_msg->buttons[event.number] = 1 - joy_msg->buttons[event.number];
+                    }
+                  } else {
+                    joy_msg->buttons[event.number] = (event.value ? 1 : 0);
+                  }
+                  // For initial events, wait a bit before sending to try to catch
+                  // all the initial events.
+                  if (!(event.type & JS_EVENT_INIT)) {
+                    publish_now = true;
+                  } else {
+                    publish_soon = true;
+                  }
+                  break;
+                case JS_EVENT_AXIS:
+                case JS_EVENT_AXIS | JS_EVENT_INIT:
+                  RCLCPP_INFO_STREAM(node_->get_logger(), "axis=" << static_cast<int>(event.number)
+                    << ", value=" << event.value << ", init=" << ((event.type & JS_EVENT_INIT) != 0));
+                  val = event.value;
+                  if (event.number >= joy_msg->axes.size()) {
+                    joy_msg->axes.resize(event.number + 1, 0.);
+                  }
+                  if (default_trig_val_) {
+                    // Allows deadzone to be "smooth"
+                    if (val > unscaled_deadzone) {
+                      val -= unscaled_deadzone;
+                    } else if (val < -unscaled_deadzone) {
+                      val += unscaled_deadzone;
+                    } else {
+                      val = 0;
+                    }
+                    joy_msg->axes[event.number] = val * scale;
+                    // Will wait a bit before sending to try to combine events.
+                    publish_soon = true;
+                    break;
+                  } else {
+                    if (!(event.type & JS_EVENT_INIT)) {
+                      val = event.value;
+                      if (val > unscaled_deadzone) {
+                        val -= unscaled_deadzone;
+                      } else if (val < -unscaled_deadzone) {
+                        val += unscaled_deadzone;
+                      } else {
+                        val = 0;
+                      }
+                      joy_msg->axes[event.number] = val * scale;
+                    }
+
+                    publish_soon = true;
+                    break;
+                  }
+                default:
+                  RCLCPP_WARN(
+                    node_->get_logger(), "joy_linux_node: Unknown event type. "
+                    "Please file a ticket. time=%u, value=%d, type=%Xh, number=%d",
+                    event.time, event.value, event.type, event.number);
+                  break;
+              }
+            } else if (tv_set) {  // Assume that the timer has expired.
+              joy_msg->header.stamp = node_->now();
+              publish_now = true;
+            }
+
+            if (publish_now) {
+              // Assume that all the JS_EVENT_INIT messages have arrived already.
+              // This should be the case as the kernel sends them along as soon as
+              // the device opens.
+              joy_msg->header.stamp = node_->now();
+              pub_->publish(*joy_msg);
+
+              publish_now = false;
+              tv_set = false;
+              publication_pending = false;
+              publish_soon = false;
+              pub_count_++;
+            }
+
+            // If an axis event occurred, start a timer to combine with other
+            // events.
+            if (!publication_pending && publish_soon) {
+              tv.tv_sec = trunc(coalesce_interval_);
+              tv.tv_usec = (coalesce_interval_ - tv.tv_sec) * 1e6;
+              publication_pending = true;
+              tv_set = true;
+            }
+
+            // If nothing is going on, start a timer to do autorepeat.
+            if (!tv_set && autorepeat_rate_ > 0) {
+              tv.tv_sec = trunc(autorepeat_interval);
+              tv.tv_usec = (autorepeat_interval - tv.tv_sec) * 1e6;
+              tv_set = true;
+            }
+
+            if (!tv_set) {
+              tv.tv_sec = 1;
+              tv.tv_usec = 0;
+            }
+          }
+          catch (std::system_error const& e)
+          {
+            if (e.code() == std::error_code(EINTR, std::system_category()))
+              RCLCPP_INFO_STREAM(node_->get_logger(), e.what());
+            else
+              throw;
+          }
+        }  // End of joystick open loop.
+
+        rclcpp::spin_some(node_);
+        if (rclcpp::ok()) {
+          RCLCPP_ERROR(
+            node_->get_logger(), "Connection to joystick device lost unexpectedly. Will reopen.");
+        }
       }
     }
 
-cleanup:
     RCLCPP_INFO(node_->get_logger(), "joy_node shut down.");
 
     return 0;
@@ -549,6 +531,6 @@ cleanup:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  Joystick j;
+  JoystickNode j;
   return j.main(argc, argv);
 }
